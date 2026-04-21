@@ -1,0 +1,258 @@
+# fastlane/Fastfile
+# Production-grade Fastlane configuration for React Native
+
+# Minimum Fastlane version
+fastlane_version "2.220.0"
+
+# ─────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────
+
+# Bump build number using timestamp (great for CI)
+def bump_build_number_timestamp
+  timestamp = Time.now.strftime("%Y%m%d%H%M")
+  timestamp.to_i
+end
+
+# Read version from package.json
+def get_version_from_package_json
+  package_json = JSON.parse(File.read("../package.json"))
+  package_json["version"]
+end
+
+# ─────────────────────────────────────────────────────
+# BEFORE ALL
+# ─────────────────────────────────────────────────────
+
+before_all do
+  # Ensure we're running with clean git status on CI
+  if ENV["CI"]
+    ensure_git_status_clean(
+      show_uncommitted_changes: true,
+      ignore_files: [
+        "android/app/release.keystore",
+        "fastlane/google-play-key.json",
+      ]
+    )
+  end
+end
+
+# ─────────────────────────────────────────────────────
+# IOS LANES
+# ─────────────────────────────────────────────────────
+
+platform :ios do
+
+  # Private: Set up code signing with Fastlane Match
+  private_lane :setup_signing do |options|
+    type = options[:type] || "appstore"
+
+    create_keychain(
+      name: ENV["MATCH_KEYCHAIN_NAME"],
+      password: ENV["MATCH_KEYCHAIN_PASSWORD"],
+      default_keychain: true,
+      unlock: true,
+      timeout: 3600,
+    ) if ENV["CI"]
+
+    # Fastlane Match syncs certificates and provisioning profiles
+    # from a private Git repo — the industry standard approach
+    match(
+      type: type,
+      app_identifier: ENV["APP_IDENTIFIER"] || "com.yourcompany.rnpipelinedemo",
+      git_url: ENV["MATCH_GIT_URL"],
+      git_basic_authorization: ENV["MATCH_GIT_BASIC_AUTHORIZATION"],
+      password: ENV["MATCH_PASSWORD"],
+      keychain_name: ENV["MATCH_KEYCHAIN_NAME"],
+      keychain_password: ENV["MATCH_KEYCHAIN_PASSWORD"],
+      readonly: true, # Don't generate new certs in CI — only read
+    )
+  end
+
+  # Private: Build the IPA
+  private_lane :build_ios do |options|
+    configuration = options[:configuration] || "Release"
+    export_method = options[:export_method] || "app-store"
+
+    # Automatically set version and build number
+    version_number = get_version_from_package_json
+    build_number = bump_build_number_timestamp
+
+    increment_version_number(
+      version_number: version_number,
+      xcodeproj: "ios/RNPipelineDemo.xcodeproj"
+    )
+    increment_build_number(
+      build_number: build_number,
+      xcodeproj: "ios/RNPipelineDemo.xcodeproj"
+    )
+
+    # Build the archive
+    gym(
+      workspace: "ios/RNPipelineDemo.xcworkspace",
+      scheme: "RNPipelineDemo",
+      configuration: configuration,
+      export_method: export_method,
+      output_directory: "ios/build",
+      output_name: "RNPipelineDemo.ipa",
+      clean: true,
+      xcargs: "-allowProvisioningUpdates",
+      # Disable Bitcode (deprecated in Xcode 14+)
+      include_bitcode: false,
+      include_symbols: true,
+    )
+  end
+
+  # LANE: Distribute to internal testers via Firebase App Distribution
+  lane :beta do
+    UI.message("🚀 Starting iOS Beta build...")
+
+    setup_signing(type: "adhoc")
+    build_ios(configuration: "Release", export_method: "ad-hoc")
+
+    # Upload to Firebase App Distribution
+    firebase_app_distribution(
+      app: ENV["FIREBASE_APP_ID_IOS"],
+      firebase_cli_token: ENV["FIREBASE_TOKEN"],
+      groups: "internal-testers, qa-team",
+      release_notes: "Branch: #{git_branch} | Commit: #{last_git_commit[:abbreviated_commit_hash]} | #{last_git_commit[:message]}",
+    )
+
+    UI.success("✅ iOS Beta uploaded to Firebase App Distribution")
+  end
+
+  # LANE: Upload to TestFlight (for main branch / production)
+  lane :release do
+    UI.message("🚀 Starting iOS Release build...")
+
+    # Use App Store Connect API key (no 2FA issues in CI)
+    api_key = app_store_connect_api_key(
+      key_id: ENV["APP_STORE_CONNECT_API_KEY_KEY_ID"],
+      issuer_id: ENV["APP_STORE_CONNECT_API_KEY_ISSUER_ID"],
+      key_content: ENV["APP_STORE_CONNECT_API_KEY_KEY"],
+      is_key_content_base64: false,
+      duration: 1200,
+      in_house: false,
+    )
+
+    setup_signing(type: "appstore")
+    build_ios(configuration: "Release", export_method: "app-store")
+
+    # Upload to TestFlight
+    pilot(
+      api_key: api_key,
+      ipa: "ios/build/RNPipelineDemo.ipa",
+      skip_waiting_for_build_processing: true,
+      notify_external_testers: false,
+      changelog: "New build from #{git_branch}",
+    )
+
+    # Tag the release in git
+    add_git_tag(
+      tag: "ios/v#{get_version_from_package_json}/#{bump_build_number_timestamp}",
+      message: "iOS release build"
+    )
+    push_git_tags
+
+    UI.success("✅ iOS build uploaded to TestFlight")
+  end
+end
+
+# ─────────────────────────────────────────────────────
+# ANDROID LANES
+# ─────────────────────────────────────────────────────
+
+platform :android do
+
+  # Private: Build the APK or AAB
+  private_lane :build_android do |options|
+    task = options[:task] || "bundle"       # 'bundle' = AAB, 'assemble' = APK
+    build_type = options[:build_type] || "Release"
+
+    version_name = get_version_from_package_json
+    version_code = bump_build_number_timestamp.to_i
+
+    # Inject version into Gradle properties
+    gradle(
+      task: task,
+      build_type: build_type,
+      project_dir: "android",
+      properties: {
+        "android.injected.signing.store.file" => ENV["ANDROID_KEYSTORE_PATH"],
+        "android.injected.signing.store.password" => ENV["ANDROID_STORE_PASSWORD"],
+        "android.injected.signing.key.alias" => ENV["ANDROID_KEY_ALIAS"],
+        "android.injected.signing.key.password" => ENV["ANDROID_KEY_PASSWORD"],
+        "versionCode" => version_code,
+        "versionName" => version_name,
+      }
+    )
+  end
+
+  # LANE: Distribute APK to Firebase App Distribution (internal testers)
+  lane :beta do
+    UI.message("🚀 Starting Android Beta build...")
+
+    build_android(task: "assemble", build_type: "Release")
+
+    firebase_app_distribution(
+      app: ENV["FIREBASE_APP_ID_ANDROID"],
+      firebase_cli_token: ENV["FIREBASE_TOKEN"],
+      android_artifact_type: "APK",
+      apk_path: lane_context[SharedValues::GRADLE_APK_OUTPUT_PATH],
+      groups: "internal-testers, qa-team",
+      release_notes: "Branch: #{git_branch} | Commit: #{last_git_commit[:abbreviated_commit_hash]} | #{last_git_commit[:message]}",
+    )
+
+    UI.success("✅ Android Beta uploaded to Firebase App Distribution")
+  end
+
+  # LANE: Upload AAB to Google Play (production)
+  lane :release do
+    UI.message("🚀 Starting Android Release build...")
+
+    build_android(task: "bundle", build_type: "Release")
+
+    # Upload to Google Play Store (internal track first, then promote)
+    supply(
+      track: "internal",
+      aab: lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH],
+      json_key_data: ENV["SUPPLY_JSON_KEY"],
+      package_name: ENV["ANDROID_PACKAGE_NAME"] || "com.yourcompany.rnpipelinedemo",
+      release_status: "completed",
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+    )
+
+    # Tag the release
+    add_git_tag(
+      tag: "android/v#{get_version_from_package_json}/#{bump_build_number_timestamp}",
+      message: "Android release build"
+    )
+    push_git_tags
+
+    UI.success("✅ Android AAB uploaded to Google Play (internal track)")
+  end
+end
+
+# ─────────────────────────────────────────────────────
+# ERROR HANDLING
+# ─────────────────────────────────────────────────────
+
+error do |lane, exception, options|
+  UI.error("❌ Lane '#{lane}' failed with: #{exception.message}")
+
+  # Optionally send Slack notification on failure
+  if ENV["SLACK_WEBHOOK"]
+    slack(
+      message: "❌ Fastlane build failed on lane: #{lane}",
+      slack_url: ENV["SLACK_WEBHOOK"],
+      success: false,
+      payload: {
+        "Error" => exception.message,
+        "Branch" => git_branch,
+      }
+    )
+  end
+end

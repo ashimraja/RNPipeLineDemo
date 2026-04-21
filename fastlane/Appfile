@@ -1,0 +1,12 @@
+# fastlane/Appfile
+# This file stores global configuration for your Fastlane setup
+
+app_identifier(ENV["APP_IDENTIFIER"] || "com.yourcompany.rnpipelinedemo")
+
+apple_id(ENV["APPLE_ID"] || "your@apple.id")
+itc_team_id(ENV["ITC_TEAM_ID"])     # App Store Connect team ID
+team_id(ENV["TEAM_ID"])             # Developer Portal team ID
+
+# For Google Play
+json_key_file(ENV["SUPPLY_JSON_KEY_PATH"] || "fastlane/google-play-key.json")
+package_name(ENV["ANDROID_PACKAGE_NAME"] || "com.yourcompany.rnpipelinedemo")

@@ -1,0 +1,6 @@
+# Fastlane Pluginfile
+# This file is managed by Fastlane. Run `fastlane add_plugin <name>` to add plugins.
+
+gem_source "https://rubygems.org"
+
+gem "fastlane-plugin-firebase_app_distribution"
